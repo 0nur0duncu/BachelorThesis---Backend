@@ -1,0 +1,756 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/BachelorThesis/Backend/config"
+
+	vision "cloud.google.com/go/vision/v2/apiv1"
+	visionpb "cloud.google.com/go/vision/v2/apiv1/visionpb"
+	"github.com/gin-gonic/gin"
+	"github.com/streadway/amqp"
+)
+
+var (
+	workerCtx       context.Context
+	workerCancelFn  context.CancelFunc
+	isProcessing    bool
+	processingMutex sync.Mutex
+)
+
+// ProcessedResult represents an OCR processing result
+type ProcessedResult struct {
+	JobID      string `json:"job_id"`
+	PageNumber int    `json:"page_number"`
+	Text       string `json:"text"`
+}
+
+// ProcessHandlers contains handlers for OCR processing operations
+type ProcessHandlers struct {
+	db              *sql.DB
+	purgeMutex      *sync.Mutex
+	queueMutex      *sync.Mutex
+	purgeInProgress *bool
+	queuePaused     *bool
+}
+
+// NewProcessHandlers creates a new ProcessHandlers instance
+func NewProcessHandlers(db *sql.DB, purgeMutex *sync.Mutex, queueMutex *sync.Mutex,
+	purgeInProgress *bool, queuePaused *bool) *ProcessHandlers {
+	return &ProcessHandlers{
+		db:              db,
+		purgeMutex:      purgeMutex,
+		queueMutex:      queueMutex,
+		purgeInProgress: purgeInProgress,
+		queuePaused:     queuePaused,
+	}
+}
+
+// StartProcess starts processing OCR jobs from the queue
+func (h *ProcessHandlers) StartProcess(c *gin.Context) {
+	processingMutex.Lock()
+	if isProcessing {
+		processingMutex.Unlock()
+		c.JSON(http.StatusConflict, gin.H{
+			"status":  "error",
+			"message": "OCR processing is already running",
+		})
+		return
+	}
+
+	// Get number of workers from query parameter (default to 5)
+	workersStr := c.DefaultQuery("workers", "1")
+	workers, err := strconv.Atoi(workersStr)
+	if err != nil || workers < 1 {
+		workers = 5
+	}
+
+	// Set global context to be able to cancel workers
+	workerCtx, workerCancelFn = context.WithCancel(context.Background())
+	isProcessing = true
+	processingMutex.Unlock()
+
+	log.Printf("Starting OCR processing with %d workers", workers)
+
+	go h.startWorkers(workers)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": fmt.Sprintf("OCR processing started with %d workers", workers),
+	})
+}
+
+// StopProcess stops the OCR processing workers
+func (h *ProcessHandlers) StopProcess(c *gin.Context) {
+	processingMutex.Lock()
+	defer processingMutex.Unlock()
+
+	if !isProcessing {
+		c.JSON(http.StatusConflict, gin.H{
+			"status":  "error",
+			"message": "OCR processing is not running",
+		})
+		return
+	}
+
+	if workerCancelFn != nil {
+		workerCancelFn()
+		workerCancelFn = nil
+	}
+
+	isProcessing = false
+	log.Println("OCR processing stopped")
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": "OCR processing stopped",
+	})
+}
+
+// startWorkers starts the specified number of worker goroutines to process OCR tasks
+func (h *ProcessHandlers) startWorkers(numWorkers int) {
+	var wg sync.WaitGroup
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go h.processOCRWorker(workerCtx, i, &wg)
+	}
+
+	// Wait for all workers to complete
+	wg.Wait()
+	log.Println("All OCR workers have stopped")
+
+	// Ensure process is marked as stopped
+	processingMutex.Lock()
+	isProcessing = false
+	processingMutex.Unlock()
+}
+
+// processOCRWorker runs a worker that processes images from the queue
+func (h *ProcessHandlers) processOCRWorker(ctx context.Context, workerID int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	log.Printf("Worker %d starting", workerID)
+
+	// Initialize Vision client
+	client, err := vision.NewImageAnnotatorClient(ctx)
+	if err != nil {
+		log.Printf("Worker %d: Failed to create Vision client: %v", workerID, err)
+		return
+	}
+	defer client.Close()
+
+	// Connect to RabbitMQ
+	conn, err := amqp.Dial(config.GetRabbitMQURL())
+	if err != nil {
+		log.Printf("Worker %d: Failed to connect to RabbitMQ: %v", workerID, err)
+		return
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Printf("Worker %d: Failed to open channel: %v", workerID, err)
+		return
+	}
+	defer ch.Close()
+
+	// Declare input queue
+	inputQ, err := ch.QueueDeclare(
+		"ocr_queue", // name
+		true,        // durable
+		false,       // delete when unused
+		false,       // exclusive
+		false,       // no-wait
+		nil,         // arguments
+	)
+	if err != nil {
+		log.Printf("Worker %d: Failed to declare input queue: %v", workerID, err)
+		return
+	}
+
+	// Declare output queue for processed results
+	outputQ, err := ch.QueueDeclare(
+		"ocr_results", // name
+		true,          // durable
+		false,         // delete when unused
+		false,         // exclusive
+		false,         // no-wait
+		nil,           // arguments
+	)
+	if err != nil {
+		log.Printf("Worker %d: Failed to declare output queue: %v", workerID, err)
+		return
+	}
+
+	// Set prefetch count to 1 to distribute work fairly
+	err = ch.Qos(
+		1,     // prefetch count
+		0,     // prefetch size
+		false, // global
+	)
+	if err != nil {
+		log.Printf("Worker %d: Failed to set QoS: %v", workerID, err)
+		return
+	}
+
+	msgs, err := ch.Consume(
+		inputQ.Name, // queue
+		"",          // consumer
+		false,       // auto-ack
+		false,       // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
+	)
+	if err != nil {
+		log.Printf("Worker %d: Failed to register consumer: %v", workerID, err)
+		return
+	}
+
+	log.Printf("Worker %d is now consuming from queue", workerID)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %d stopping due to cancellation", workerID)
+			return
+		case msg, ok := <-msgs:
+			if !ok {
+				log.Printf("Worker %d: Channel closed", workerID)
+				return
+			}
+
+			// Process message
+			jobID, ok := msg.Headers["job_id"].(string)
+			if !ok {
+				log.Printf("Worker %d: Missing job_id in message headers", workerID)
+				msg.Nack(false, false)
+				continue
+			}
+
+			pageNumberVal, ok := msg.Headers["page_number"]
+			if !ok {
+				log.Printf("Worker %d: Missing page_number in message headers", workerID)
+				msg.Nack(false, false)
+				continue
+			}
+			pageNumber, ok := pageNumberVal.(int32)
+			if !ok {
+				log.Printf("Worker %d: page_number is not an integer", workerID)
+				msg.Nack(false, false)
+				continue
+			}
+
+			log.Printf("Worker %d processing job %s page %d", workerID, jobID, pageNumber)
+
+			// Process OCR with Google Cloud Vision
+			text, err := h.processImageWithVision(ctx, client, msg.Body)
+			if err != nil {
+				log.Printf("Worker %d: OCR processing failed for job %s page %d: %v",
+					workerID, jobID, pageNumber, err)
+				msg.Nack(false, true) // Requeue for retry
+				continue
+			}
+
+			// Update database with OCR results
+			_, err = h.db.ExecContext(ctx,
+				"UPDATE worker_results SET text = $1 WHERE job_id = $2 AND page_number = $3",
+				text, jobID, pageNumber)
+			if err != nil {
+				log.Printf("Worker %d: Failed to update database for job %s page %d: %v",
+					workerID, jobID, pageNumber, err)
+				msg.Nack(false, true) // Requeue for retry
+				continue
+			}
+
+			// Update completed tasks count for this job
+			_, err = h.db.ExecContext(ctx,
+				"UPDATE jobs SET completed_tasks = completed_tasks + 1 WHERE job_id = $1",
+				jobID)
+			if err != nil {
+				log.Printf("Worker %d: Failed to update job completion count for %s: %v",
+					workerID, jobID, err)
+				// Continue processing even if this update fails
+			}
+
+			// Check if job is now complete
+			h.checkAndUpdateJobCompletion(jobID)
+
+			// Send to output queue
+			result := ProcessedResult{
+				JobID:      jobID,
+				PageNumber: int(pageNumber),
+				Text:       text,
+			}
+
+			resultBytes, err := json.Marshal(result)
+			if err != nil {
+				log.Printf("Worker %d: Failed to marshal result for job %s page %d: %v",
+					workerID, jobID, pageNumber, err)
+				// Continue even if sending to output queue fails
+			} else {
+				err = ch.Publish(
+					"",           // exchange
+					outputQ.Name, // routing key
+					false,        // mandatory
+					false,        // immediate
+					amqp.Publishing{
+						Headers: amqp.Table{
+							"job_id":      jobID,
+							"page_number": pageNumber,
+						},
+						ContentType:  "application/json",
+						Body:         resultBytes,
+						DeliveryMode: amqp.Persistent,
+					})
+				if err != nil {
+					log.Printf("Worker %d: Failed to publish result to output queue: %v", workerID, err)
+					// Continue even if sending to output queue fails
+				} else {
+					log.Printf("Worker %d: Published result to output queue for job %s page %d",
+						workerID, jobID, pageNumber)
+				}
+			}
+
+			// Acknowledge message only after all processing is complete
+			msg.Ack(false)
+			log.Printf("Worker %d completed processing job %s page %d", workerID, jobID, pageNumber)
+		}
+	}
+}
+
+// checkAndUpdateJobCompletion checks if all pages of a job have been processed
+// and updates the job status to "completed" if so
+func (h *ProcessHandlers) checkAndUpdateJobCompletion(jobID string) {
+	var totalTasks, completedTasks int
+	var status string
+
+	err := h.db.QueryRow(
+		"SELECT total_tasks, completed_tasks, status FROM jobs WHERE job_id = $1",
+		jobID).Scan(&totalTasks, &completedTasks, &status)
+
+	if err != nil {
+		log.Printf("Error checking job completion status for %s: %v", jobID, err)
+		return
+	}
+
+	// If all tasks are completed but status isn't "completed" yet, update it
+	if completedTasks >= totalTasks && status != "completed" {
+		_, err := h.db.Exec(
+			"UPDATE jobs SET status = 'completed' WHERE job_id = $1",
+			jobID)
+		if err != nil {
+			log.Printf("Error updating job %s to completed status: %v", jobID, err)
+		} else {
+			log.Printf("Job %s marked as completed (%d/%d pages processed)",
+				jobID, completedTasks, totalTasks)
+		}
+	}
+}
+
+// processImageWithVision processes an image with Google Cloud Vision API
+// with improved layout preservation
+func (h *ProcessHandlers) processImageWithVision(ctx context.Context, client *vision.ImageAnnotatorClient, imageData []byte) (string, error) {
+	// Create the request with the image data
+	req := &visionpb.AnnotateImageRequest{
+		Image: &visionpb.Image{
+			Content: imageData,
+		},
+		Features: []*visionpb.Feature{
+			{
+				Type:       visionpb.Feature_DOCUMENT_TEXT_DETECTION,
+				MaxResults: 1,
+			},
+		},
+		ImageContext: &visionpb.ImageContext{
+			LanguageHints: []string{"tr", "en"}, // Add English and Turkish language hints
+		},
+	}
+
+	// Call the BatchAnnotateImages method
+	resp, err := client.BatchAnnotateImages(ctx, &visionpb.BatchAnnotateImagesRequest{
+		Requests: []*visionpb.AnnotateImageRequest{req},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to detect text: %v", err)
+	}
+
+	// Check if we got a response
+	if len(resp.Responses) == 0 {
+		return "", fmt.Errorf("no response from Vision API")
+	}
+
+	// Check for API errors
+	if resp.Responses[0].Error != nil {
+		return "", fmt.Errorf("API error: %v", resp.Responses[0].Error.Message)
+	}
+
+	fullTextAnnotation := resp.Responses[0].FullTextAnnotation
+	if fullTextAnnotation == nil {
+		log.Println("No text found in the image")
+		return "", nil
+	}
+
+	// Process the document structure to preserve layout
+	return processStructuredText(fullTextAnnotation), nil
+}
+
+// processStructuredText handles the full text annotation to preserve document layout
+func processStructuredText(fullTextAnnotation *visionpb.TextAnnotation) string {
+	var result strings.Builder
+
+	// Process by pages, blocks, paragraphs to maintain structure
+	for _, page := range fullTextAnnotation.Pages {
+		// Sort blocks from top to bottom
+		blocks := make([]*visionpb.Block, len(page.Blocks))
+		copy(blocks, page.Blocks)
+
+		sort.Slice(blocks, func(i, j int) bool {
+			return getAverageY(blocks[i].BoundingBox) < getAverageY(blocks[j].BoundingBox)
+		})
+
+		for _, block := range blocks {
+			// Determine if this is likely a table or multiple columns
+			isTable := detectTableStructure(block)
+			isMultiColumn := detectMultiColumnStructure(block)
+
+			// Sort paragraphs based on reading order (top to bottom, left to right for columns)
+			paragraphs := make([]*visionpb.Paragraph, len(block.Paragraphs))
+			copy(paragraphs, block.Paragraphs)
+
+			// Sort paragraphs differently based on structure type
+			if isMultiColumn {
+				sort.Slice(paragraphs, func(i, j int) bool {
+					// For multi-column, first group by horizontal position then by vertical
+					iX, jX := getAverageX(paragraphs[i].BoundingBox), getAverageX(paragraphs[j].BoundingBox)
+					columnWidth := getMaxBlockWidth(block) / 2
+
+					// If paragraphs are in different columns
+					if math.Abs(float64(iX-jX)) > columnWidth {
+						return iX < jX // Sort by X (column position)
+					}
+					// Within same column, sort by Y
+					return getAverageY(paragraphs[i].BoundingBox) < getAverageY(paragraphs[j].BoundingBox)
+				})
+			} else {
+				sort.Slice(paragraphs, func(i, j int) bool {
+					// For normal flow, sort primarily by Y position
+					iY, jY := getAverageY(paragraphs[i].BoundingBox), getAverageY(paragraphs[j].BoundingBox)
+
+					// If paragraphs are roughly on the same line
+					if math.Abs(float64(iY-jY)) < getAverageParagraphHeight(paragraphs)*0.5 {
+						return getAverageX(paragraphs[i].BoundingBox) < getAverageX(paragraphs[j].BoundingBox)
+					}
+					return iY < jY
+				})
+			}
+
+			for pidx, paragraph := range paragraphs {
+				// Sort words based on reading order
+				words := make([]*visionpb.Word, len(paragraph.Words))
+				copy(words, paragraph.Words)
+
+				sort.Slice(words, func(i, j int) bool {
+					iY, jY := getAverageY(words[i].BoundingBox), getAverageY(words[j].BoundingBox)
+					// If words are on the same line (within tolerance)
+					if math.Abs(float64(iY-jY)) < getAverageWordHeight(words)*0.5 {
+						return getAverageX(words[i].BoundingBox) < getAverageX(words[j].BoundingBox)
+					}
+					return iY < jY
+				})
+
+				// Rebuild paragraph text from words
+				var paragraphText strings.Builder
+				lastWordEndY := float64(0)
+				lastLine := -1
+				currentLineWords := 0
+
+				for i, word := range words {
+					wordText := buildWordText(word)
+					currentY := getAverageY(word.BoundingBox)
+
+					// Detect if this word is on a new line
+					if lastLine != -1 && math.Abs(currentY-lastWordEndY) > getAverageWordHeight(words)*0.8 {
+						// Add line break for clear new lines
+						paragraphText.WriteString("\n")
+						currentLineWords = 0
+					}
+
+					// Don't add space at the beginning of a line
+					if currentLineWords > 0 {
+						// Calculate appropriate spacing
+						if i > 0 {
+							currentWordStart := getAverageX(word.BoundingBox)
+							prevWordEnd := getAverageX(words[i-1].BoundingBox) + getWidth(words[i-1].BoundingBox)
+							spacing := currentWordStart - prevWordEnd
+
+							// Add appropriate spacing based on gap
+							if spacing > getAverageWordSpacing(words)*2.5 {
+								paragraphText.WriteString("   ") // Extra space for significant gaps
+							} else if spacing > getAverageWordSpacing(words)*1.5 {
+								paragraphText.WriteString("  ") // Double space for larger gaps
+							} else {
+								paragraphText.WriteString(" ") // Normal space
+							}
+						}
+					}
+
+					paragraphText.WriteString(wordText)
+					lastWordEndY = currentY
+					lastLine = int(currentY)
+					currentLineWords++
+				}
+
+				// Add appropriate paragraph separator
+				if isTable {
+					// For tables, use clear separation
+					result.WriteString(paragraphText.String())
+					if pidx < len(paragraphs)-1 {
+						result.WriteString("\n")
+					}
+				} else {
+					// For normal text, add paragraph with double newline
+					result.WriteString(paragraphText.String())
+					if pidx < len(paragraphs)-1 {
+						// Check if the next paragraph is far enough to warrant a paragraph break
+						nextY := getAverageY(paragraphs[pidx+1].BoundingBox)
+						currY := getAverageY(paragraph.BoundingBox) + getHeight(paragraph.BoundingBox)
+						if nextY-currY > getAverageParagraphHeight(paragraphs)*1.5 {
+							result.WriteString("\n\n") // Clear paragraph separation
+						} else {
+							result.WriteString("\n") // Just a line break
+						}
+					} else {
+						result.WriteString("\n\n") // End of block
+					}
+				}
+			}
+		}
+	}
+
+	return result.String()
+}
+
+// buildWordText builds the text for a word from its symbols
+func buildWordText(word *visionpb.Word) string {
+	var wordText strings.Builder
+	for _, symbol := range word.Symbols {
+		wordText.WriteString(symbol.Text)
+		// Add special break characters if needed (hyphens, etc.)
+		if symbol.Property != nil && symbol.Property.DetectedBreak != nil {
+			switch symbol.Property.DetectedBreak.Type {
+			case visionpb.TextAnnotation_DetectedBreak_HYPHEN:
+				wordText.WriteString("-")
+			case visionpb.TextAnnotation_DetectedBreak_LINE_BREAK:
+				// Don't add anything, we'll handle line breaks at the word level
+			}
+		}
+	}
+	return wordText.String()
+}
+
+// getAverageY calculates the average Y position of the bounding box vertices
+func getAverageY(box *visionpb.BoundingPoly) float64 {
+	sum := 0.0
+	for _, vertex := range box.Vertices {
+		sum += float64(vertex.Y)
+	}
+	return sum / float64(len(box.Vertices))
+}
+
+// getAverageX calculates the average X position of the bounding box vertices
+func getAverageX(box *visionpb.BoundingPoly) float64 {
+	sum := 0.0
+	for _, vertex := range box.Vertices {
+		sum += float64(vertex.X)
+	}
+	return sum / float64(len(box.Vertices))
+}
+
+// getWidth calculates the width of a bounding box
+func getWidth(box *visionpb.BoundingPoly) float64 {
+	// Calculate width as distance between rightmost and leftmost X coordinates
+	minX, maxX := float64(box.Vertices[0].X), float64(box.Vertices[0].X)
+	for _, vertex := range box.Vertices {
+		x := float64(vertex.X)
+		if x < minX {
+			minX = x
+		}
+		if x > maxX {
+			maxX = x
+		}
+	}
+	return maxX - minX
+}
+
+// getHeight calculates the height of a bounding box
+func getHeight(box *visionpb.BoundingPoly) float64 {
+	// Calculate height as distance between bottom and top Y coordinates
+	minY, maxY := float64(box.Vertices[0].Y), float64(box.Vertices[0].Y)
+	for _, vertex := range box.Vertices {
+		y := float64(vertex.Y)
+		if y < minY {
+			minY = y
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
+	return maxY - minY
+}
+
+// getAverageWordSpacing calculates the average spacing between words
+func getAverageWordSpacing(words []*visionpb.Word) float64 {
+	if len(words) < 2 {
+		return 20.0 // Default reasonable spacing
+	}
+
+	totalSpacing := 0.0
+	spacingCount := 0
+
+	// Sort words by X position to ensure we're measuring adjacent words
+	sortedWords := make([]*visionpb.Word, len(words))
+	copy(sortedWords, words)
+	sort.Slice(sortedWords, func(i, j int) bool {
+		return getAverageX(sortedWords[i].BoundingBox) < getAverageX(sortedWords[j].BoundingBox)
+	})
+
+	for i := 0; i < len(sortedWords)-1; i++ {
+		// Only consider words on the same line
+		iY := getAverageY(sortedWords[i].BoundingBox)
+		jY := getAverageY(sortedWords[i+1].BoundingBox)
+
+		if math.Abs(float64(iY-jY)) < getAverageWordHeight(words)*0.8 {
+			currentWordEnd := getAverageX(sortedWords[i].BoundingBox) + getWidth(sortedWords[i].BoundingBox)
+			nextWordStart := getAverageX(sortedWords[i+1].BoundingBox)
+			spacing := nextWordStart - currentWordEnd
+
+			// Only consider reasonable spacing values
+			if spacing > 0 && spacing < getAverageWordWidth(words)*3 {
+				totalSpacing += spacing
+				spacingCount++
+			}
+		}
+	}
+
+	if spacingCount > 0 {
+		return totalSpacing / float64(spacingCount)
+	}
+	return 20.0 // Default spacing if we can't calculate
+}
+
+// getAverageWordWidth calculates the average width of words
+func getAverageWordWidth(words []*visionpb.Word) float64 {
+	if len(words) == 0 {
+		return 30.0 // Default reasonable width
+	}
+
+	totalWidth := 0.0
+	for _, word := range words {
+		totalWidth += getWidth(word.BoundingBox)
+	}
+	return totalWidth / float64(len(words))
+}
+
+// getAverageWordHeight calculates the average height of words
+func getAverageWordHeight(words []*visionpb.Word) float64 {
+	if len(words) == 0 {
+		return 20.0 // Default reasonable height
+	}
+
+	totalHeight := 0.0
+	for _, word := range words {
+		totalHeight += getHeight(word.BoundingBox)
+	}
+	return totalHeight / float64(len(words))
+}
+
+// getAverageParagraphHeight calculates the average height of paragraphs
+func getAverageParagraphHeight(paragraphs []*visionpb.Paragraph) float64 {
+	if len(paragraphs) == 0 {
+		return 40.0 // Default reasonable paragraph height
+	}
+
+	totalHeight := 0.0
+	for _, paragraph := range paragraphs {
+		totalHeight += getHeight(paragraph.BoundingBox)
+	}
+	return totalHeight / float64(len(paragraphs))
+}
+
+// getMaxBlockWidth returns the maximum width of a block
+func getMaxBlockWidth(block *visionpb.Block) float64 {
+	return getWidth(block.BoundingBox)
+}
+
+// detectTableStructure tries to determine if a block represents a table
+func detectTableStructure(block *visionpb.Block) bool {
+	if len(block.Paragraphs) < 2 {
+		return false
+	}
+
+	// Tables often have regular patterns of paragraphs
+	paragraphs := block.Paragraphs
+
+	// Check for common alignments that might indicate a table
+	columnPositions := make(map[int]int)
+	for _, para := range paragraphs {
+		xPos := int(getAverageX(para.BoundingBox)/10) * 10 // Quantize to reduce noise
+		columnPositions[xPos]++
+	}
+
+	// If we have multiple paragraphs aligned in columns, likely a table
+	columnCount := 0
+	for _, count := range columnPositions {
+		if count >= 2 {
+			columnCount++
+		}
+	}
+
+	return columnCount >= 2
+}
+
+// detectMultiColumnStructure tries to determine if a block has multiple columns
+func detectMultiColumnStructure(block *visionpb.Block) bool {
+	if len(block.Paragraphs) < 4 {
+		return false
+	}
+
+	// Get block width
+	blockWidth := getWidth(block.BoundingBox)
+
+	// Check x-positions of paragraphs
+	xPositions := make([]float64, len(block.Paragraphs))
+	for i, para := range block.Paragraphs {
+		xPositions[i] = getAverageX(para.BoundingBox)
+	}
+
+	// Sort x-positions
+	sort.Float64s(xPositions)
+
+	// Check if there's a gap in x-positions that could indicate columns
+	for i := 1; i < len(xPositions); i++ {
+		if xPositions[i]-xPositions[i-1] > blockWidth*0.3 {
+			// Found a significant gap - might be columns
+			leftCount := i
+			rightCount := len(xPositions) - i
+
+			// Only consider it columns if somewhat balanced
+			if leftCount >= 2 && rightCount >= 2 {
+				return true
+			}
+		}
+	}
+
+	return false
+}

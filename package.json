@@ -1,0 +1,14 @@
+{
+  "name": "rabbitmq-dashboard",
+  "version": "1.0.0",
+  "description": "Dashboard for RabbitMQ metrics",
+  "main": "cors-proxy.js",
+  "scripts": {
+    "start": "node cors-proxy.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "http-proxy-middleware": "^2.0.6"
+  }
+}

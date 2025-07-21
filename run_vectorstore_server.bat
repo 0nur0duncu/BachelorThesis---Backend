@@ -1,0 +1,16 @@
+@echo off
+echo Creating/activating virtual environment...
+
+IF NOT EXIST venv (
+    echo Creating virtual environment...
+    python -m venv venv
+)
+
+echo Activating virtual environment...
+call venv\Scripts\activate.bat
+
+echo Installing dependencies...
+pip install -r requirements.txt
+
+echo Starting Vector Store API server...
+python app.py 

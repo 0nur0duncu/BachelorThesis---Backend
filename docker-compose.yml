@@ -1,0 +1,73 @@
+services:
+  db:
+    image: postgres:12
+    container_name: pgdb
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: guest
+      POSTGRES_PASSWORD: guest
+      POSTGRES_DB: lisanstezi
+      POSTGRES_ROOT_PASSWORD: root
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - lisanstezi-network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "guest"]
+      interval: 10s
+      retries: 5
+      timeout: 5s
+
+  # pgadmin:
+  #   image: dpage/pgadmin4
+  #   container_name: pgadmin4
+  #   restart: always
+  #   ports:
+  #     - "8888:80"
+  #   environment:
+  #     PGADMIN_DEFAULT_EMAIL: user-name@domain-name.com
+  #     PGADMIN_DEFAULT_PASSWORD: strong-password
+  #   # volumes:
+  #   #   - pgadmin-data:/var/lib/pgadmin
+  #   depends_on:
+  #     - db
+
+  # firstservice:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: firstservice
+  #   depends_on:
+  #     - db
+  #     - rabbitmq
+  #   env_file:
+  #     - .env
+  #   restart: always
+  #   ports:
+  #     - "8080:5000"
+  #   networks:
+  #     - lisanstezi-network
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    networks:
+      - lisanstezi-network
+
+networks:
+  lisanstezi-network:
+    driver: bridge
+
+volumes:
+  pgdata:
+  # pgadmin-data:

@@ -1,0 +1,27 @@
+#file:main.go #file:init.sql dosyasındaki servisi python ile oluşturmak istiyorum. Ayrıca eklemeler de olacak. Proje flask ile yapılacak. Pdf leri png ye çevirmek için pymupdf kullanılacak. En kısa sürede bitmeli. Eş zamanlı çalıştırma gibi mekanizmalar kullanmalısın. Kullanıcı bir pdf yüklediği zaman bu pdf files/<job_id>/pageNumber.png olarak kaydedilecek. postgre veritabanı bağlantısı için sqlalchemy kullan. Kullanıcının yüklediği pdf önce geçici olarak temp klasörüne alınır. sayfaları png ye çevrildikten sonra temp klasöründen silinir. Rabbitmq için pika kullanılacak. main.go dosyasından farklı olarak yüklenen pdf doğrudan kuyruğa gitmeyecek. resimlerin pathleri veritabanında tutulacak. Yeni endpointler olacak. /api/v1/admin/start => tüm jobları kuyruğa yükler /api/v1/admin/start/<job_id> => belirli bir jobı kuyruğa yükler /api/v1/admin/start/<job_id>/page/<pagenumber> => belirli bir jobdaki belirli bir sayfayı kuyruğa yükler. Kuruğa yüklenen istek şu formatta olacak. job_id, sayfa numarası ve resmin base64 encode hali kuyruğa json formatında yüklenecek. /files içerisindeki yüklenmiş joblar silinmeyecek. /api/v1/admin/stop => kuyruğa iş yüklemeyi durdurur. Kuyurğa iş yüklenirkende eş zamanlı yüklenecek. job_id ve pagenumber tutulduğu için karışık olabilir. yazdığın kod ilgili klasörler altında modüler olmalıdır.Gerekli loglar o günkü tarih .log olarak tutulmalıdır.
+
+
+PDF işlemleri için pymupdf (fitz)
+veritabanı için sqlalchemy, postgresql
+kuyruk için RabbitMQ pika
+Server olarak fastapi
+
+Veritabanında jobs tablosunda job_id, filename, excluded_ ,totalPageNumber, completedPages, status ,created_at
+Veritabanında pages tablosunda job_id, pageNumber, path, text, status
+
+Kullanıcı pdf veya resim yükleyecek. Pdf önce sayfalarına ayrılıp png ye çevrilecek ve files/<job_id>/pagenumber olarak kaydedilecek.
+Kullanıcının yüklediği pdf hemen kuyruğa yüklenmeyecek. Kullanıcıya pending dönecek. Aynı zamanda veritabanında path kısmında resmin pathi tutulacak. Kod modüler olacak.
+
+/api/v1/ocrimage => resim yüklemek için
+/api/v1/ocrpdf => pdf yüklemek için
+/api/v1/admin/jobs => henüz tamamlanmamış işleri listeler
+/api/v1/admin/job/{job_id} => Belirli bir işe ait detayları getirir.
+/api/v1/admin/start => tüm jobları kuyruğa yükler.
+/api/v1/admin/start/{job_id} => belirli bir job i kuyurğa yükler
+/api/v1/admin/start/{job_id}/page/{pageNumber} => belirli bir sayfayı kuyruğa yükler.
+/api/v1/admin/stop => kuyruğa yüklemeyi durdurur.
+/api/v1/admin/delete/job/{job_id}/page/{pageNumber} => belirli bir jobdaki belirli bir sayfayı siler
+/api/v1/admin/delete/job/{job_id} => belirli bir job ı siler
+/api/v1/admin/delete/jobs => tüm jobları files içinden ve kuyruktan varsa siler.
+/api/v1/admin/delete/queue => sadece kuyruktakileri temizler.
+Bu işlemler çok hızlı gerçekleşmeli ve sistemi de yormamalı. Kullanıcı işlemlerin bitmesini beklemeyecek. Sinyal verecek arka planda gerçekleşecek.

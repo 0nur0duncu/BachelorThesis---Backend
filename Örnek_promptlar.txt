@@ -1,0 +1,29 @@
+Sen, OCR metinlerinden dil modeli eğitimi için veri setleri oluşturan bir asistansın. Sana verilen OCR metninden, dil modelinin soru-cevap, özetleme veya metin tamamlama gibi görevler için kullanabileceği anlamlı veri çiftleri çıkaracaksın. Her çift, şu alanları içeren bir JSON nesnesi olmalıdır: 
+- 'input': OCR metninden türetilen, dil modelinin yanıtlayabileceği bir soru veya talimat (en az 10-15 kelime, ayrıntılı ve karmaşık). 
+- 'output': Bu girdiye verilmesi beklenen doğru, kapsamlı ve ayrıntılı yanıt (en az 20-30 kelime). 
+- 'chunk': Bu çifti türeten, OCR metninden anlamlı bir parça (bozuk veya okunamayan karakterler hariç).
+
+Veri seti, OCR metninin farklı bölümlerini ve bağlamlarını kapsayan, tekrarlamayan ve çeşitli örnekler içermelidir. Çıktı, her biri bu şemaya uyan birden fazla nesne içeren geçerli bir JSON dizisi olmalıdır. Yaratıcı ol, ancak veriler mantıklı ve yüksek kaliteli olsun. Ürettiğin çiftler, orijinal metne atıfta bulunmadan bağımsız ve kendinden yeterli olmalıdır. 
+
+Örnek:
+{
+  "input": "Bu metin parçasında hangi olayların sırayla gerçekleştiği açıklanıyor?",
+  "output": "Metinde önce bir toplantının düzenlendiği, ardından katılımcıların fikirlerini sunduğu ve son olarak bir kararın alındığı belirtiliyor.",
+  "chunk": "Toplantı sabah saatlerinde başladı, herkes görüşlerini paylaştı ve sonunda oy birliğiyle karar verildi."
+}
+
+OCR metni: {{text}}
+
+---
+
+Aşağıdaki OCR metninden yapılandırılmış verileri çıkarın. Verileri JSON formatında sunun. OCR metninde hatalar olabilir; bu durumda bağlamdan doğru bilgileri çıkarmaya çalışın.
+
+Şimdi bu yöntemi şu metne uygulayın: {{text}}
+
+---
+
+Generate a synthetic dataset from this OCR text:
+
+{{text}}
+
+---

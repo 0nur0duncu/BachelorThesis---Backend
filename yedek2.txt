@@ -1,0 +1,656 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/BachelorThesis/Backend/config"
+	"github.com/gin-gonic/gin"
+	"github.com/google/generative-ai-go/genai"
+	"github.com/streadway/amqp"
+	"google.golang.org/api/option"
+)
+
+// DatasetEntry represents a single entry in the dataset
+type DatasetEntry struct {
+	Input  string `json:"input"`
+	Output string `json:"output"`
+	Chunk  string `json:"chunk"`
+}
+
+// TokenUsage tracks token usage for Gemini API calls
+type TokenUsage struct {
+	JobID           string
+	PageNumber      int
+	PromptTokens    int32
+	ResponseTokens  int32
+	TotalTokens     int32
+	EstimatedTokens int32 // From CountTokens call
+	Timestamp       time.Time
+}
+
+// DatasetHandlers contains handlers for dataset generation operations
+type DatasetHandlers struct {
+	db              *sql.DB
+	purgeMutex      *sync.Mutex
+	queueMutex      *sync.Mutex
+	purgeInProgress *bool
+	queuePaused     *bool
+	tokenUsage      []TokenUsage // Track token usage across requests
+	tokenMutex      sync.Mutex   // Mutex for concurrent token usage updates
+}
+
+// NewDatasetHandlers creates a new DatasetHandlers instance
+func NewDatasetHandlers(db *sql.DB, purgeMutex *sync.Mutex, queueMutex *sync.Mutex,
+	purgeInProgress *bool, queuePaused *bool) *DatasetHandlers {
+	return &DatasetHandlers{
+		db:              db,
+		purgeMutex:      purgeMutex,
+		queueMutex:      queueMutex,
+		purgeInProgress: purgeInProgress,
+		queuePaused:     queuePaused,
+		tokenUsage:      make([]TokenUsage, 0),
+	}
+}
+
+// StartDatasetGeneration starts generating dataset from all jobs in ocr_results queue
+func (h *DatasetHandlers) StartDatasetGeneration(c *gin.Context) {
+	// Ensure database table exists
+	if err := h.ensureDatasetTable(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": fmt.Sprintf("Failed to ensure dataset table: %v", err),
+		})
+		return
+	}
+
+	// Ensure token usage table exists
+	if err := h.ensureTokenUsageTable(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": fmt.Sprintf("Failed to ensure token usage table: %v", err),
+		})
+		return
+	}
+
+	go h.processAllJobs()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": "Dataset generation started for all jobs",
+	})
+}
+
+// StartJobDatasetGeneration starts generating dataset for a specific job
+func (h *DatasetHandlers) StartJobDatasetGeneration(c *gin.Context) {
+	jobID := c.Param("jobID")
+
+	// Check if job exists
+	var exists bool
+	err := h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = $1)", jobID).Scan(&exists)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": fmt.Sprintf("Database error: %v", err),
+		})
+		return
+	}
+
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{
+			"status":  "error",
+			"message": "Job not found",
+		})
+		return
+	}
+
+	// Ensure database tables exist
+	if err := h.ensureDatasetTable(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": fmt.Sprintf("Failed to ensure dataset table: %v", err),
+		})
+		return
+	}
+
+	if err := h.ensureTokenUsageTable(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": fmt.Sprintf("Failed to ensure token usage table: %v", err),
+		})
+		return
+	}
+
+	go h.processJobDataset(jobID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": fmt.Sprintf("Dataset generation started for job %s", jobID),
+	})
+}
+
+// DeleteAllDatasets deletes all datasets
+func (h *DatasetHandlers) DeleteAllDatasets(c *gin.Context) {
+	_, err := h.db.Exec("DELETE FROM dataset")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": fmt.Sprintf("Failed to delete datasets: %v", err),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": "All datasets deleted",
+	})
+}
+
+// DeleteJobDataset deletes dataset for a specific job
+func (h *DatasetHandlers) DeleteJobDataset(c *gin.Context) {
+	jobID := c.Param("jobID")
+
+	result, err := h.db.Exec("DELETE FROM dataset WHERE job_id = $1", jobID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": fmt.Sprintf("Failed to delete job dataset: %v", err),
+		})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{
+			"status":  "error",
+			"message": "No dataset found for this job",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": fmt.Sprintf("Dataset for job %s deleted", jobID),
+		"count":   rowsAffected,
+	})
+}
+
+// ensureDatasetTable creates the dataset table if it doesn't exist
+func (h *DatasetHandlers) ensureDatasetTable() error {
+	_, err := h.db.Exec(`
+		CREATE TABLE IF NOT EXISTS dataset (
+			id SERIAL PRIMARY KEY,
+			job_id TEXT NOT NULL,
+			page_number INTEGER NOT NULL,
+			input TEXT NOT NULL,
+			output TEXT NOT NULL,
+			chunk TEXT NOT NULL,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+			CONSTRAINT fk_job FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+		)
+	`)
+	return err
+}
+
+// ensureTokenUsageTable creates the token_usage table if it doesn't exist
+func (h *DatasetHandlers) ensureTokenUsageTable() error {
+	_, err := h.db.Exec(`
+		CREATE TABLE IF NOT EXISTS token_usage (
+			id SERIAL PRIMARY KEY,
+			job_id TEXT NOT NULL,
+			page_number INTEGER NOT NULL,
+			prompt_tokens INTEGER NOT NULL,
+			response_tokens INTEGER NOT NULL,
+			total_tokens INTEGER NOT NULL,
+			estimated_tokens INTEGER NOT NULL,
+			timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+			CONSTRAINT fk_job_token FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+		)
+	`)
+	return err
+}
+
+// processAllJobs processes all jobs to generate datasets
+func (h *DatasetHandlers) processAllJobs() {
+	// Get all completed jobs
+	rows, err := h.db.Query("SELECT job_id FROM jobs WHERE status = 'completed'")
+	if err != nil {
+		log.Printf("Error querying completed jobs: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var jobIDs []string
+	for rows.Next() {
+		var jobID string
+		if err := rows.Scan(&jobID); err != nil {
+			log.Printf("Error scanning job ID: %v", err)
+			continue
+		}
+		jobIDs = append(jobIDs, jobID)
+	}
+
+	// Process each job
+	for _, jobID := range jobIDs {
+		h.processJobDataset(jobID)
+	}
+}
+
+// processJobDataset processes a specific job to generate dataset
+func (h *DatasetHandlers) processJobDataset(jobID string) {
+	// Connect to RabbitMQ
+	conn, err := amqp.Dial(config.GetRabbitMQURL())
+	if err != nil {
+		log.Printf("Failed to connect to RabbitMQ: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Printf("Failed to open channel: %v", err)
+		return
+	}
+	defer ch.Close()
+
+	// Declare the ocr_results queue
+	resultsQueue, err := ch.QueueDeclare(
+		"ocr_results", // name
+		true,          // durable
+		false,         // delete when unused
+		false,         // exclusive
+		false,         // no-wait
+		nil,           // arguments
+	)
+	if err != nil {
+		log.Printf("Failed to declare queue: %v", err)
+		return
+	}
+
+	// Initialize Gemini client
+	ctx := context.Background()
+	client, err := genai.NewClient(ctx, option.WithAPIKey(os.Getenv("GEMINI_API_KEY")))
+	if err != nil {
+		log.Printf("Failed to create Gemini client: %v", err)
+		return
+	}
+	defer client.Close()
+
+	// Configure Gemini model
+	model := client.GenerativeModel("gemini-2.5-pro-preview-03-25")
+	model.ResponseMIMEType = "application/json"
+
+	// Define the dataset entry schema
+	model.ResponseSchema = &genai.Schema{
+		Type: genai.TypeArray,
+		Items: &genai.Schema{
+			Type: genai.TypeObject,
+			Properties: map[string]*genai.Schema{
+				"input":  {Type: genai.TypeString},
+				"output": {Type: genai.TypeString},
+				"chunk":  {Type: genai.TypeString},
+			},
+			Required: []string{"input", "output", "chunk"},
+		},
+	}
+
+	// System instruction for Gemini
+	model.SystemInstruction = &genai.Content{
+		Parts: []genai.Part{genai.Text(`
+			You are a dataset generator for OCR text processing. 
+			Create a synthetic dataset from the provided OCR text.
+			Extract meaningful pairs of input and output that could be used for training a language model.
+			The 'input' field should be a question or instruction derived from the text content.
+			The 'output' field should be the expected response to that input.
+			The 'chunk' field should contain the relevant text segment from which this pair was derived.
+			Return the data as a JSON array containing multiple entries, each with "input", "output", and "chunk" fields.
+			Be creative but ensure the data is high quality and diverse.
+			Always return valid JSON that strictly follows the specified schema.
+		`)},
+	}
+
+	// Get messages for this job from the queue
+	msgs, err := ch.Consume(
+		resultsQueue.Name, // queue
+		"",                // consumer
+		false,             // auto-ack (we'll manually ack)
+		false,             // exclusive
+		false,             // no-local
+		false,             // no-wait
+		nil,               // arguments
+	)
+	if err != nil {
+		log.Printf("Failed to register a consumer: %v", err)
+		return
+	}
+
+	// Process messages from the channel
+	for msg := range msgs {
+		// Check if message belongs to our job
+		msgJobID, ok := msg.Headers["job_id"].(string)
+		if !ok || msgJobID != jobID {
+			// This message is for a different job, put it back in the queue
+			msg.Nack(false, true)
+			continue
+		}
+
+		// Extract page number
+		pageNumberVal, ok := msg.Headers["page_number"]
+		if !ok {
+			log.Printf("Missing page_number in message headers")
+			msg.Nack(false, false) // Don't requeue, this message is broken
+			continue
+		}
+
+		// Convert page number to int
+		var pageNumber int
+		switch v := pageNumberVal.(type) {
+		case int32:
+			pageNumber = int(v)
+		case int:
+			pageNumber = v
+		case int64:
+			pageNumber = int(v)
+		case float64:
+			pageNumber = int(v)
+		default:
+			log.Printf("Invalid page_number type: %T", pageNumberVal)
+			msg.Nack(false, false)
+			continue
+		}
+
+		// Parse the message body
+		var result struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(msg.Body, &result); err != nil {
+			log.Printf("Error unmarshaling message: %v", err)
+			msg.Nack(false, false) // Don't requeue
+			continue
+		}
+
+		if len(result.Text) < 50 {
+			log.Printf("Text for job %s page %d is too short, skipping", jobID, pageNumber)
+			// Acknowledge message even though we're skipping it - we've evaluated it
+			msg.Ack(false)
+			continue
+		}
+
+		// Generate dataset entries using Gemini with retry mechanism and token tracking
+		datasetEntries, tokenUsage, err := h.generateDatasetWithRetry(ctx, model, result.Text, jobID, pageNumber)
+		if err != nil {
+			log.Printf("Failed to generate dataset for job %s page %d after retries: %v", jobID, pageNumber, err)
+			// We tried our best, ack the message anyway to remove it from queue
+			msg.Ack(false)
+			continue
+		}
+
+		// Store token usage in database
+		if tokenUsage != nil {
+			_, err := h.db.Exec(`
+				INSERT INTO token_usage (job_id, page_number, prompt_tokens, response_tokens, total_tokens, estimated_tokens)
+				VALUES ($1, $2, $3, $4, $5, $6)
+			`, tokenUsage.JobID, tokenUsage.PageNumber, tokenUsage.PromptTokens,
+				tokenUsage.ResponseTokens, tokenUsage.TotalTokens, tokenUsage.EstimatedTokens)
+
+			if err != nil {
+				log.Printf("Error storing token usage for job %s page %d: %v", jobID, pageNumber, err)
+			}
+		}
+
+		// Store dataset entries in database
+		for _, entry := range datasetEntries {
+			_, err := h.db.Exec(`
+				INSERT INTO dataset (job_id, page_number, input, output, chunk)
+				VALUES ($1, $2, $3, $4, $5)
+			`, jobID, pageNumber, entry.Input, entry.Output, entry.Chunk)
+			if err != nil {
+				log.Printf("Error storing dataset entry for job %s page %d: %v", jobID, pageNumber, err)
+			}
+		}
+
+		log.Printf("Generated %d dataset entries for job %s page %d", len(datasetEntries), jobID, pageNumber)
+
+		// Acknowledge the message to remove it from the queue
+		msg.Ack(false)
+	}
+}
+
+// generateDatasetWithRetry attempts to generate a dataset with retries if JSON parsing fails
+func (h *DatasetHandlers) generateDatasetWithRetry(ctx context.Context, model *genai.GenerativeModel, text string, jobID string, pageNumber int) ([]DatasetEntry, *TokenUsage, error) {
+	maxRetries := 3
+	retryDelay := 2 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Generate dataset entries using Gemini
+		prompt := fmt.Sprintf("Generate a synthetic dataset from this OCR text:\n\n%s", text)
+		if attempt > 1 {
+			prompt += "\n\nIMPORTANT: Please ensure your response is valid JSON that strictly follows the required schema. Previous attempts failed to parse the JSON."
+		}
+
+		// Estimate token count before sending
+		promptContent := genai.Text(prompt)
+		tokenCountResp, err := model.CountTokens(ctx, promptContent)
+		var estimatedTokens int32 = 0
+		if err != nil {
+			log.Printf("Warning: Failed to count tokens for job %s page %d: %v", jobID, pageNumber, err)
+		} else {
+			estimatedTokens = tokenCountResp.TotalTokens
+			log.Printf("Estimated token count for job %s page %d: %d tokens", jobID, pageNumber, estimatedTokens)
+		}
+
+		// Generate content
+		resp, err := model.GenerateContent(ctx, promptContent)
+		if err != nil {
+			log.Printf("Error generating dataset for job %s page %d (attempt %d/%d): %v",
+				jobID, pageNumber, attempt, maxRetries, err)
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		// Track token usage from response
+		tokenUsage := &TokenUsage{
+			JobID:           jobID,
+			PageNumber:      pageNumber,
+			EstimatedTokens: estimatedTokens,
+			Timestamp:       time.Now(),
+		}
+
+		// Extract token usage metadata if available
+		if resp.UsageMetadata != nil {
+			tokenUsage.PromptTokens = resp.UsageMetadata.PromptTokenCount
+			tokenUsage.ResponseTokens = resp.UsageMetadata.CandidatesTokenCount
+			tokenUsage.TotalTokens = resp.UsageMetadata.TotalTokenCount
+
+			log.Printf("Token usage for job %s page %d: prompt=%d, response=%d, total=%d",
+				jobID, pageNumber, tokenUsage.PromptTokens, tokenUsage.ResponseTokens, tokenUsage.TotalTokens)
+		} else {
+			log.Printf("No token usage metadata available for job %s page %d", jobID, pageNumber)
+		}
+
+		// Store token usage in memory
+		h.tokenMutex.Lock()
+		h.tokenUsage = append(h.tokenUsage, *tokenUsage)
+		h.tokenMutex.Unlock()
+
+		// Parse response
+		datasetEntries, err := h.parseGeminiResponse(resp)
+		if err != nil {
+			log.Printf("Error parsing Gemini response for job %s page %d (attempt %d/%d): %v",
+				jobID, pageNumber, attempt, maxRetries, err)
+
+			// Log the raw response to help diagnose issues
+			for _, candidate := range resp.Candidates {
+				for _, part := range candidate.Content.Parts {
+					if txt, ok := part.(genai.Text); ok {
+						log.Printf("Raw response (first 200 chars): %s", txt[:min(200, len(txt))])
+					}
+				}
+			}
+
+			// Wait before retrying
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		// If we got here, we successfully parsed the response
+		return datasetEntries, tokenUsage, nil
+	}
+
+	return nil, nil, fmt.Errorf("failed to generate dataset after %d attempts", maxRetries)
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// parseGeminiResponse parses the Gemini model response into dataset entries
+func (h *DatasetHandlers) parseGeminiResponse(resp *genai.GenerateContentResponse) ([]DatasetEntry, error) {
+	if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+		return nil, fmt.Errorf("empty response from Gemini")
+	}
+
+	// Extract the text content from the response
+	var textContent string
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if txt, ok := part.(genai.Text); ok {
+			textContent = string(txt)
+			break
+		}
+	}
+
+	if textContent == "" {
+		return nil, fmt.Errorf("no text content in Gemini response")
+	}
+
+	// Clean up JSON content - sometimes the model adds markdown code blocks
+	textContent = cleanJSONString(textContent)
+
+	// Parse the JSON response
+	var entries []DatasetEntry
+	if err := json.Unmarshal([]byte(textContent), &entries); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON response: %v", err)
+	}
+
+	// Validate entries
+	var validEntries []DatasetEntry
+	for _, entry := range entries {
+		if entry.Input != "" && entry.Output != "" {
+			validEntries = append(validEntries, entry)
+		}
+	}
+
+	if len(validEntries) == 0 {
+		return nil, fmt.Errorf("no valid entries found in response")
+	}
+
+	return validEntries, nil
+}
+
+// GetTokenUsageStats returns token usage statistics for a handler
+func (h *DatasetHandlers) GetTokenUsageStats(c *gin.Context) {
+	// Query from database
+	rows, err := h.db.Query(`
+		SELECT 
+			job_id, 
+			COUNT(*) as request_count,
+			SUM(prompt_tokens) as total_prompt_tokens,
+			SUM(response_tokens) as total_response_tokens,
+			SUM(total_tokens) as grand_total_tokens,
+			AVG(total_tokens) as avg_tokens_per_request
+		FROM token_usage
+		GROUP BY job_id
+		ORDER BY grand_total_tokens DESC
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": fmt.Sprintf("Failed to query token usage: %v", err),
+		})
+		return
+	}
+	defer rows.Close()
+
+	var stats []gin.H
+	var totalRequests int64
+	var totalPromptTokens, totalResponseTokens, grandTotalTokens int64
+
+	for rows.Next() {
+		var jobID string
+		var requestCount, promptTokens, responseTokens, tokenTotal int64
+		var avgTokens float64
+
+		if err := rows.Scan(&jobID, &requestCount, &promptTokens, &responseTokens, &tokenTotal, &avgTokens); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"status":  "error",
+				"message": fmt.Sprintf("Error scanning results: %v", err),
+			})
+			return
+		}
+
+		totalRequests += requestCount
+		totalPromptTokens += promptTokens
+		totalResponseTokens += responseTokens
+		grandTotalTokens += tokenTotal
+
+		stats = append(stats, gin.H{
+			"job_id":                 jobID,
+			"requests":               requestCount,
+			"prompt_tokens":          promptTokens,
+			"response_tokens":        responseTokens,
+			"total_tokens":           tokenTotal,
+			"avg_tokens_per_request": avgTokens,
+		})
+	}
+
+	// Return the statistics
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "success",
+		"job_stats": stats,
+		"summary": gin.H{
+			"total_requests":        totalRequests,
+			"total_prompt_tokens":   totalPromptTokens,
+			"total_response_tokens": totalResponseTokens,
+			"grand_total_tokens":    grandTotalTokens,
+			"estimated_cost_usd":    fmt.Sprintf("$%.4f", float64(grandTotalTokens)*0.000003), // Example rate: $0.000003 per token
+		},
+	})
+}
+
+// cleanJSONString removes markdown code blocks and other potential wrapping from JSON strings
+func cleanJSONString(input string) string {
+	// Remove markdown JSON code block if present
+	input = trimPrefix(input, "```json")
+	input = trimPrefix(input, "```")
+	input = trimSuffix(input, "```")
+
+	// Trim whitespace
+	return input
+}
+
+// trimPrefix removes a prefix from a string if present
+func trimPrefix(s, prefix string) string {
+	if len(s) >= len(prefix) && s[:len(prefix)] == prefix {
+		s = s[len(prefix):]
+	}
+	return s
+}
+
+// trimSuffix removes a suffix from a string if present
+func trimSuffix(s, suffix string) string {
+	if len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix {
+		s = s[:len(s)-len(suffix)]
+	}
+	return s
+}
